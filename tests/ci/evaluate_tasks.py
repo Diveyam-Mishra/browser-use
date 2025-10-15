@@ -13,11 +13,11 @@ import os
 import sys
 import warnings
 
-import aiofiles
+import anyio
 import yaml
 from pydantic import BaseModel
 
-from browser_use import Agent, AgentHistoryList, BrowserProfile, BrowserSession, ChatOpenAI
+from browser_use import Agent, AgentHistoryList, BrowserProfile, BrowserSession, ChatGoogle
 from browser_use.llm.messages import UserMessage
 
 # --- CONFIG ---
@@ -47,8 +47,7 @@ async def run_single_task(task_file):
 		warnings.filterwarnings('ignore')
 
 		print('[DEBUG] Loading task file...', file=sys.stderr)
-		async with aiofiles.open(task_file, 'r') as f:
-			content = await f.read()
+		content = await anyio.Path(task_file).read_text()
 		task_data = yaml.safe_load(content)
 		task = task_data['task']
 		judge_context = task_data.get('judge_context', ['The agent must solve the task'])
@@ -57,8 +56,8 @@ async def run_single_task(task_file):
 		print(f'[DEBUG] Task: {task[:100]}...', file=sys.stderr)
 		print(f'[DEBUG] Max steps: {max_steps}', file=sys.stderr)
 
-		agent_llm = ChatOpenAI(model='gpt-4.1-mini')
-		judge_llm = ChatOpenAI(model='gpt-4.1-mini')
+		agent_llm = ChatGoogle(model='gemini-flash-latest')
+		judge_llm = ChatGoogle(model='gemini-flash-latest')
 		print('[DEBUG] LLMs initialized', file=sys.stderr)
 
 		# Each subprocess gets its own profile and session

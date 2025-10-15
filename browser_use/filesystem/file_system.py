@@ -272,7 +272,7 @@ class FileSystem:
 
 					reader = pypdf.PdfReader(full_filename)
 					num_pages = len(reader.pages)
-					MAX_PDF_PAGES = 10
+					MAX_PDF_PAGES = 20
 					extra_pages = num_pages - MAX_PDF_PAGES
 					extracted_text = ''
 					for page in reader.pages[:MAX_PDF_PAGES]:
@@ -376,7 +376,7 @@ class FileSystem:
 		await file_obj.write(content, self.data_dir)
 		self.files[extracted_filename] = file_obj
 		self.extracted_content_count += 1
-		return f'Extracted content saved to file {extracted_filename} successfully.'
+		return extracted_filename
 
 	def describe(self) -> str:
 		"""List all files with their content information using file-specific display methods"""

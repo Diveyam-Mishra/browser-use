@@ -23,6 +23,7 @@ from browser_use.dom.views import (
 	SerializedDOMState,
 	TargetAllTrees,
 )
+from browser_use.observability import observe_debug
 
 if TYPE_CHECKING:
 	from browser_use.browser.session import BrowserSession
@@ -130,6 +131,7 @@ class DomService:
 			name=ax_node.get('name', {}).get('value', None),
 			description=ax_node.get('description', {}).get('value', None),
 			properties=properties,
+			child_ids=ax_node.get('childIds', []) if ax_node.get('childIds') else None,
 		)
 		return enhanced_ax_node
 
@@ -234,8 +236,8 @@ class DomService:
 				frame_intersects = (
 					adjusted_x < viewport_right
 					and adjusted_x + current_bounds.width > viewport_left
-					and adjusted_y < viewport_bottom
-					and adjusted_y + current_bounds.height > viewport_top
+					and adjusted_y < viewport_bottom + 1000
+					and adjusted_y + current_bounds.height > viewport_top - 1000
 				)
 
 				if not frame_intersects:
@@ -445,6 +447,7 @@ class DomService:
 			cdp_timing=cdp_timing,
 		)
 
+	@observe_debug(ignore_input=True, ignore_output=True, name='get_dom_tree')
 	async def get_dom_tree(
 		self,
 		target_id: TargetID,
@@ -610,7 +613,16 @@ class DomService:
 
 			if 'children' in node and node['children']:
 				dom_tree_node.children_nodes = []
+				# Build set of shadow root node IDs to filter them out from children
+				shadow_root_node_ids = set()
+				if 'shadowRoots' in node and node['shadowRoots']:
+					for shadow_root in node['shadowRoots']:
+						shadow_root_node_ids.add(shadow_root['nodeId'])
+
 				for child in node['children']:
+					# Skip shadow roots - they should only be in shadow_roots list
+					if child['nodeId'] in shadow_root_node_ids:
+						continue
 					dom_tree_node.children_nodes.append(
 						await _construct_enhanced_node(child, updated_html_frames, total_frame_offset)
 					)
@@ -710,6 +722,7 @@ class DomService:
 
 		return enhanced_dom_tree_node
 
+	@observe_debug(ignore_input=True, ignore_output=True, name='get_serialized_dom_tree')
 	async def get_serialized_dom_tree(
 		self, previous_cached_state: SerializedDOMState | None = None
 	) -> tuple[SerializedDOMState, EnhancedDOMTreeNode, dict[str, float]]:
