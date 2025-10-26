@@ -122,11 +122,7 @@ class CDPSession(BaseModel):
 		result = await self.cdp_client.send.Target.attachToTarget(
 			params={
 				'targetId': self.target_id,
-				'flatten': True,
-				'filter': [  # type: ignore
-					{'type': 'page', 'exclude': False},
-					{'type': 'iframe', 'exclude': False},
-				],
+				'flatten': True,  # removed filter as a param because it doesn't exist at https://chromedevtools.github.io/devtools-protocol/tot/Target/#method-attachToTarget
 			}
 		)
 		self.session_id = result['sessionId']
@@ -526,7 +522,7 @@ class BrowserSession(BaseModel):
 						self.logger.info('🌤️ Successfully connected to cloud browser service')
 					except CloudBrowserAuthError:
 						raise CloudBrowserAuthError(
-							'Authentication failed for cloud browser service. Set BROWSER_USE_API_KEY environment variable. You can also create an API key at https://cloud.browser-use.com'
+							'Authentication failed for cloud browser service. Set BROWSER_USE_API_KEY environment variable. You can also create an API key at https://cloud.browser-use.com/new-api-key'
 						)
 					except CloudBrowserError as e:
 						raise CloudBrowserError(f'Failed to create cloud browser: {e}')
@@ -1828,6 +1824,38 @@ class BrowserSession(BaseModel):
 		# Return empty dict if nothing available
 		return {}
 
+	async def get_index_by_id(self, element_id: str) -> int | None:
+		"""Find element index by its id attribute.
+
+		Args:
+			element_id: The id attribute value to search for
+
+		Returns:
+			Index of the element, or None if not found
+		"""
+		selector_map = await self.get_selector_map()
+		for idx, element in selector_map.items():
+			if element.attributes and element.attributes.get('id') == element_id:
+				return idx
+		return None
+
+	async def get_index_by_class(self, class_name: str) -> int | None:
+		"""Find element index by its class attribute (matches if class contains the given name).
+
+		Args:
+			class_name: The class name to search for
+
+		Returns:
+			Index of the first matching element, or None if not found
+		"""
+		selector_map = await self.get_selector_map()
+		for idx, element in selector_map.items():
+			if element.attributes:
+				element_class = element.attributes.get('class', '')
+				if class_name in element_class.split():
+					return idx
+		return None
+
 	async def remove_highlights(self) -> None:
 		"""Remove highlights from the page using CDP."""
 		if not self.browser_profile.highlight_elements:
@@ -2135,7 +2163,7 @@ class BrowserSession(BaseModel):
 
 			# Convert selector_map to the format expected by the highlighting script
 			elements_data = []
-			for interactive_index, node in selector_map.items():
+			for _, node in selector_map.items():
 				# Get bounding box using absolute position (includes iframe translations) if available
 				if node.absolute_position:
 					# Use absolute position which includes iframe coordinate translations
@@ -2149,7 +2177,6 @@ class BrowserSession(BaseModel):
 							'y': bbox['y'],
 							'width': bbox['width'],
 							'height': bbox['height'],
-							'interactive_index': interactive_index,
 							'element_name': node.node_name,
 							'is_clickable': node.snapshot_node.is_clickable if node.snapshot_node else True,
 							'is_scrollable': getattr(node, 'is_scrollable', False),
@@ -2242,7 +2269,7 @@ class BrowserSession(BaseModel):
 				interactiveElements.forEach((element, index) => {{
 					const highlight = document.createElement('div');
 					highlight.setAttribute('data-browser-use-highlight', 'element');
-					highlight.setAttribute('data-element-id', element.interactive_index);
+					highlight.setAttribute('data-element-id', element.backend_node_id);
 					highlight.style.cssText = `
 						position: absolute;
 						left: ${{element.x}}px;
@@ -2260,8 +2287,8 @@ class BrowserSession(BaseModel):
 						border: none;
 					`;
 					
-					// Enhanced label with interactive index
-					const label = createTextElement('div', element.interactive_index, `
+					// Enhanced label with backend node ID
+					const label = createTextElement('div', element.backend_node_id, `
 						position: absolute;
 						top: -20px;
 						left: 0;
@@ -2899,9 +2926,7 @@ class BrowserSession(BaseModel):
 				)
 				object_id = result.get('object', {}).get('objectId')
 				if not object_id:
-					raise ValueError(
-						f'Could not find #{node.element_index} backendNodeId={node.backend_node_id} in target_id={cdp_session.target_id}'
-					)
+					raise ValueError(f'Could not find backendNodeId={node.backend_node_id} in target_id={cdp_session.target_id}')
 				return cdp_session
 			except (ValueError, Exception) as e:
 				# Fall back to main session if frame not found
@@ -2916,9 +2941,7 @@ class BrowserSession(BaseModel):
 				)
 				object_id = result.get('object', {}).get('objectId')
 				if not object_id:
-					raise ValueError(
-						f'Could not find #{node.element_index} backendNodeId={node.backend_node_id} in target_id={cdp_session.target_id}'
-					)
+					raise ValueError(f'Could not find backendNodeId={node.backend_node_id} in target_id={cdp_session.target_id}')
 			except Exception as e:
 				self.logger.debug(f'Failed to get CDP client for target {node.target_id}: {e}, using main session')
 
