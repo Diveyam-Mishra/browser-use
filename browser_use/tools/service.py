@@ -1,5 +1,4 @@
 import asyncio
-import enum
 import json
 import logging
 import os
@@ -14,6 +13,7 @@ from pydantic import BaseModel
 from browser_use.agent.views import ActionModel, ActionResult
 from browser_use.browser import BrowserSession
 from browser_use.browser.events import (
+	ClickCoordinateEvent,
 	ClickElementEvent,
 	CloseTabEvent,
 	GetDropdownOptionsEvent,
@@ -33,10 +33,13 @@ from browser_use.llm.base import BaseChatModel
 from browser_use.llm.messages import SystemMessage, UserMessage
 from browser_use.observability import observe_debug
 from browser_use.tools.registry.service import Registry
+from browser_use.tools.utils import get_click_description
 from browser_use.tools.views import (
 	ClickElementAction,
+	ClickElementActionIndexOnly,
 	CloseTabAction,
 	DoneAction,
+	ExtractAction,
 	GetDropdownOptionsAction,
 	InputTextAction,
 	NavigateAction,
@@ -49,7 +52,7 @@ from browser_use.tools.views import (
 	SwitchTabAction,
 	UploadFileAction,
 )
-from browser_use.utils import time_execution_sync
+from browser_use.utils import create_task_with_error_handling, sanitize_surrogates, time_execution_sync
 
 logger = logging.getLogger(__name__)
 
@@ -102,12 +105,14 @@ def handle_browser_error(e: BrowserError) -> ActionResult:
 class Tools(Generic[Context]):
 	def __init__(
 		self,
-		exclude_actions: list[str] = [],
+		exclude_actions: list[str] | None = None,
 		output_model: type[T] | None = None,
 		display_files_in_done_text: bool = True,
 	):
-		self.registry = Registry[Context](exclude_actions)
+		self.registry = Registry[Context](exclude_actions if exclude_actions is not None else [])
 		self.display_files_in_done_text = display_files_in_done_text
+		self._output_model: type[BaseModel] | None = output_model
+		self._coordinate_clicking_enabled: bool = False
 
 		"""Register all default browser actions"""
 
@@ -204,7 +209,7 @@ class Tools(Generic[Context]):
 					# Return error in ActionResult instead of re-raising
 					return ActionResult(error=f'Navigation failed: {str(e)}')
 
-		@self.registry.action('', param_model=NoParamsAction)
+		@self.registry.action('Go back', param_model=NoParamsAction)
 		async def go_back(_: NoParamsAction, browser_session: BrowserSession):
 			try:
 				event = browser_session.event_bus.dispatch(GoBackEvent())
@@ -218,30 +223,86 @@ class Tools(Generic[Context]):
 				error_msg = f'Failed to go back: {str(e)}'
 				return ActionResult(error=error_msg)
 
-		@self.registry.action('')
+		@self.registry.action('Wait for x seconds.')
 		async def wait(seconds: int = 3):
 			# Cap wait time at maximum 30 seconds
 			# Reduce the wait time by 3 seconds to account for the llm call which takes at least 3 seconds
 			# So if the model decides to wait for 5 seconds, the llm call took at least 3 seconds, so we only need to wait for 2 seconds
 			# Note by Mert: the above doesnt make sense because we do the LLM call right after this or this could be followed by another action after which we would like to wait
 			# so I revert this.
-			actual_seconds = min(max(seconds - 3, 0), 30)
+			actual_seconds = min(max(seconds - 1, 0), 30)
 			memory = f'Waited for {seconds} seconds'
 			logger.info(f'🕒 waited for {seconds} second{"" if seconds == 1 else "s"}')
 			await asyncio.sleep(actual_seconds)
 			return ActionResult(extracted_content=memory, long_term_memory=memory)
 
-		# Element Interaction Actions
+		# Helper function for coordinate conversion
+		def _convert_llm_coordinates_to_viewport(llm_x: int, llm_y: int, browser_session: BrowserSession) -> tuple[int, int]:
+			"""Convert coordinates from LLM screenshot size to original viewport size."""
+			if browser_session.llm_screenshot_size and browser_session._original_viewport_size:
+				original_width, original_height = browser_session._original_viewport_size
+				llm_width, llm_height = browser_session.llm_screenshot_size
 
-		@self.registry.action(
-			'',
-			param_model=ClickElementAction,
-		)
-		async def click(params: ClickElementAction, browser_session: BrowserSession):
-			# Dispatch click event with node
+				# Convert coordinates using fractions
+				actual_x = int((llm_x / llm_width) * original_width)
+				actual_y = int((llm_y / llm_height) * original_height)
+
+				logger.info(
+					f'🔄 Converting coordinates: LLM ({llm_x}, {llm_y}) @ {llm_width}x{llm_height} '
+					f'→ Viewport ({actual_x}, {actual_y}) @ {original_width}x{original_height}'
+				)
+				return actual_x, actual_y
+			return llm_x, llm_y
+
+		# Element Interaction Actions
+		async def _click_by_coordinate(params: ClickElementAction, browser_session: BrowserSession) -> ActionResult:
+			# Ensure coordinates are provided (type safety)
+			if params.coordinate_x is None or params.coordinate_y is None:
+				return ActionResult(error='Both coordinate_x and coordinate_y must be provided')
+
+			try:
+				# Convert coordinates from LLM size to original viewport size if resizing was used
+				actual_x, actual_y = _convert_llm_coordinates_to_viewport(
+					params.coordinate_x, params.coordinate_y, browser_session
+				)
+
+				# Highlight the coordinate being clicked (truly non-blocking)
+				asyncio.create_task(browser_session.highlight_coordinate_click(actual_x, actual_y))
+
+				# Dispatch ClickCoordinateEvent - handler will check for safety and click
+				event = browser_session.event_bus.dispatch(
+					ClickCoordinateEvent(coordinate_x=actual_x, coordinate_y=actual_y, force=True)
+				)
+				await event
+				# Wait for handler to complete and get any exception or metadata
+				click_metadata = await event.event_result(raise_if_any=True, raise_if_none=False)
+
+				# Check for validation errors (only happens when force=False)
+				if isinstance(click_metadata, dict) and 'validation_error' in click_metadata:
+					error_msg = click_metadata['validation_error']
+					return ActionResult(error=error_msg)
+
+				memory = f'Clicked on coordinate {params.coordinate_x}, {params.coordinate_y}'
+				msg = f'🖱️ {memory}'
+				logger.info(msg)
+
+				return ActionResult(
+					extracted_content=memory,
+					metadata={'click_x': actual_x, 'click_y': actual_y},
+				)
+			except BrowserError as e:
+				return handle_browser_error(e)
+			except Exception as e:
+				error_msg = f'Failed to click at coordinates ({params.coordinate_x}, {params.coordinate_y}).'
+				return ActionResult(error=error_msg)
+
+		async def _click_by_index(
+			params: ClickElementAction | ClickElementActionIndexOnly, browser_session: BrowserSession
+		) -> ActionResult:
+			assert params.index is not None
 			try:
 				assert params.index != 0, (
-					'Cannot click on element with index 0. If there are no interactive elements use scroll(), wait(), refresh(), etc. to troubleshoot'
+					'Cannot click on element with index 0. If there are no interactive elements use wait(), refresh(), etc. to troubleshoot'
 				)
 
 				# Look up the node from the selector map
@@ -251,17 +312,37 @@ class Tools(Generic[Context]):
 					logger.warning(f'⚠️ {msg}')
 					return ActionResult(extracted_content=msg)
 
+				# Get description of clicked element
+				element_desc = get_click_description(node)
+
 				# Highlight the element being clicked (truly non-blocking)
-				asyncio.create_task(browser_session.highlight_interaction_element(node))
+				create_task_with_error_handling(
+					browser_session.highlight_interaction_element(node), name='highlight_click_element', suppress_exceptions=True
+				)
 
 				event = browser_session.event_bus.dispatch(ClickElementEvent(node=node))
 				await event
 				# Wait for handler to complete and get any exception or metadata
 				click_metadata = await event.event_result(raise_if_any=True, raise_if_none=False)
-				memory = 'Clicked element'
 
-				msg = f'🖱️ {memory}'
-				logger.info(msg)
+				# Check if result contains validation error (e.g., trying to click <select> or file input)
+				if isinstance(click_metadata, dict) and 'validation_error' in click_metadata:
+					error_msg = click_metadata['validation_error']
+					# If it's a select element, try to get dropdown options as a helpful shortcut
+					if 'Cannot click on <select> elements.' in error_msg:
+						try:
+							return await dropdown_options(
+								params=GetDropdownOptionsAction(index=params.index), browser_session=browser_session
+							)
+						except Exception as dropdown_error:
+							logger.debug(
+								f'Failed to get dropdown options as shortcut during click on dropdown: {type(dropdown_error).__name__}: {dropdown_error}'
+							)
+					return ActionResult(error=error_msg)
+
+				# Build memory with element info
+				memory = f'Clicked {element_desc}'
+				logger.info(f'🖱️ {memory}')
 
 				# Include click coordinates in metadata if available
 				return ActionResult(
@@ -269,24 +350,20 @@ class Tools(Generic[Context]):
 					metadata=click_metadata if isinstance(click_metadata, dict) else None,
 				)
 			except BrowserError as e:
-				if 'Cannot click on <select> elements.' in str(e):
-					try:
-						return await dropdown_options(
-							params=GetDropdownOptionsAction(index=params.index), browser_session=browser_session
-						)
-					except Exception as dropdown_error:
-						logger.error(
-							f'Failed to get dropdown options as shortcut during click_element_by_index on dropdown: {type(dropdown_error).__name__}: {dropdown_error}'
-						)
-					return ActionResult(error='Can not click on select elements.')
-
 				return handle_browser_error(e)
 			except Exception as e:
 				error_msg = f'Failed to click element {params.index}: {str(e)}'
 				return ActionResult(error=error_msg)
 
+		# Store click handlers for re-registration
+		self._click_by_index = _click_by_index
+		self._click_by_coordinate = _click_by_coordinate
+
+		# Register click action (index-only by default)
+		self._register_click_action()
+
 		@self.registry.action(
-			'',
+			'Input text into element by index.',
 			param_model=InputTextAction,
 		)
 		async def input(
@@ -303,7 +380,9 @@ class Tools(Generic[Context]):
 				return ActionResult(extracted_content=msg)
 
 			# Highlight the element being typed into (truly non-blocking)
-			asyncio.create_task(browser_session.highlight_interaction_element(node))
+			create_task_with_error_handling(
+				browser_session.highlight_interaction_element(node), name='highlight_type_element', suppress_exceptions=True
+			)
 
 			# Dispatch type text event with node
 			try:
@@ -327,14 +406,14 @@ class Tools(Generic[Context]):
 				# Create message with sensitive data handling
 				if has_sensitive_data:
 					if sensitive_key_name:
-						msg = f'Input {sensitive_key_name} into element {params.index}.'
-						log_msg = f'Input <{sensitive_key_name}> into element {params.index}.'
+						msg = f'Typed {sensitive_key_name}'
+						log_msg = f'Typed <{sensitive_key_name}>'
 					else:
-						msg = f'Input sensitive data into element {params.index}.'
-						log_msg = f'Input <sensitive> into element {params.index}.'
+						msg = 'Typed sensitive data'
+						log_msg = 'Typed <sensitive>'
 				else:
-					msg = f"Input '{params.text}' into element {params.index}."
-					log_msg = msg
+					msg = f"Typed '{params.text}'"
+					log_msg = f"Typed '{params.text}'"
 
 				logger.debug(log_msg)
 
@@ -349,7 +428,7 @@ class Tools(Generic[Context]):
 			except Exception as e:
 				# Log the full error for debugging
 				logger.error(f'Failed to dispatch TypeTextEvent: {type(e).__name__}: {e}')
-				error_msg = f'Failed to input text into element {params.index}: {e}'
+				error_msg = f'Failed to type text into element {params.index}: {e}'
 				return ActionResult(error=error_msg)
 
 		@self.registry.action(
@@ -379,7 +458,7 @@ class Tools(Generic[Context]):
 							if not browser_session.is_local:
 								pass
 							else:
-								msg = f'File path {params.path} is not available. Upload files must be in available_file_paths, downloaded_files, or a file managed by file_system.'
+								msg = f'File path {params.path} is not available. To fix: The user must add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{params.path}"])'
 								logger.error(f'❌ {msg}')
 								return ActionResult(error=msg)
 					else:
@@ -387,7 +466,7 @@ class Tools(Generic[Context]):
 						if not browser_session.is_local:
 							pass
 						else:
-							msg = f'File path {params.path} is not available. Upload files must be in available_file_paths, downloaded_files, or a file managed by file_system.'
+							msg = f'File path {params.path} is not available. To fix: The user must add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{params.path}"])'
 							raise BrowserError(message=msg, long_term_memory=msg)
 
 			# For local browsers, ensure the file exists on the local filesystem
@@ -450,7 +529,11 @@ class Tools(Generic[Context]):
 
 			# Highlight the file input element if found (truly non-blocking)
 			if file_input_node:
-				asyncio.create_task(browser_session.highlight_interaction_element(file_input_node))
+				create_task_with_error_handling(
+					browser_session.highlight_interaction_element(file_input_node),
+					name='highlight_file_input',
+					suppress_exceptions=True,
+				)
 
 			# If not found near the selected element, fallback to finding the closest file input to current scroll position
 			if file_input_node is None:
@@ -485,8 +568,13 @@ class Tools(Generic[Context]):
 				if closest_file_input:
 					file_input_node = closest_file_input
 					logger.info(f'Found file input closest to scroll position (distance: {min_distance}px)')
+
 					# Highlight the fallback file input element (truly non-blocking)
-					asyncio.create_task(browser_session.highlight_interaction_element(file_input_node))
+					create_task_with_error_handling(
+						browser_session.highlight_interaction_element(file_input_node),
+						name='highlight_file_input_fallback',
+						suppress_exceptions=True,
+					)
 				else:
 					msg = 'No file upload element found on the page'
 					logger.error(msg)
@@ -564,24 +652,21 @@ class Tools(Generic[Context]):
 					long_term_memory=memory,
 				)
 
-		# Content Actions
-
-		# TODO: Refactor to use events instead of direct page access
-		# This action is temporarily disabled as it needs refactoring to use events
-
 		@self.registry.action(
-			"""LLM extracts structured data from page markdown. Use when: on right page, know what to extract, haven't called before on same page+query. Can't get interactive elements. Set extract_links=True for URLs. Use start_from_char if truncated. If fails, use find_text/scroll instead.""",
+			"""LLM extracts structured data from page markdown. Use when: on right page, know what to extract, haven't called before on same page+query. Can't get interactive elements. Set extract_links=True for URLs. Use start_from_char if previous extraction was truncated to extract data further down the page.""",
+			param_model=ExtractAction,
 		)
 		async def extract(
-			query: str,
+			params: ExtractAction,
 			browser_session: BrowserSession,
 			page_extraction_llm: BaseChatModel,
 			file_system: FileSystem,
-			extract_links: bool = False,
-			start_from_char: int = 0,
 		):
 			# Constants
 			MAX_CHAR_LIMIT = 30000
+			query = params['query'] if isinstance(params, dict) else params.query
+			extract_links = params['extract_links'] if isinstance(params, dict) else params.extract_links
+			start_from_char = params['start_from_char'] if isinstance(params, dict) else params.start_from_char
 
 			# Extract clean markdown using the unified method
 			try:
@@ -599,7 +684,7 @@ class Tools(Generic[Context]):
 			if start_from_char > 0:
 				if start_from_char >= len(content):
 					return ActionResult(
-						error=f'start_from_char ({start_from_char}) exceeds content length ({len(content)}). Content has {final_filtered_length} characters after filtering.'
+						error=f'start_from_char ({start_from_char}) exceeds content length {final_filtered_length} characters.'
 					)
 				content = content[start_from_char:]
 				content_stats['started_from_char'] = start_from_char
@@ -660,6 +745,10 @@ You will be given a query and the markdown of a webpage that has been filtered t
 </output>
 """.strip()
 
+			# Sanitize surrogates from content to prevent UTF-8 encoding errors
+			content = sanitize_surrogates(content)
+			query = sanitize_surrogates(query)
+
 			prompt = f'<query>\n{query}\n</query>\n\n<content_stats>\n{stats_summary}\n</content_stats>\n\n<webpage_content>\n{content}\n</webpage_content>'
 
 			try:
@@ -694,7 +783,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				raise RuntimeError(str(e))
 
 		@self.registry.action(
-			"""Scroll by pages (down=True/False, pages=0.5-10.0, default 1.0). Use index for scroll containers (dropdowns/custom UI). High pages (10) reaches bottom. Multi-page scrolls sequentially. Viewport-based height, fallback 1000px/page.""",
+			"""Scroll by pages. REQUIRED: down=True/False (True=scroll down, False=scroll up, default=True). Optional: pages=0.5-10.0 (default 1.0). Use index for scroll containers (dropdowns/custom UI). High pages (10) reaches bottom. Multi-page scrolls sequentially. Viewport-based height, fallback 1000px/page.""",
 			param_model=ScrollAction,
 		)
 		async def scroll(params: ScrollAction, browser_session: BrowserSession):
@@ -753,7 +842,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 							completed_scrolls += 1
 
 							# Small delay to ensure scroll completes before next one
-							await asyncio.sleep(0.3)
+							await asyncio.sleep(0.15)
 
 						except Exception as e:
 							logger.warning(f'Scroll {i + 1}/{num_full_pages} failed: {e}')
@@ -817,7 +906,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				error_msg = f'Failed to send keys: {str(e)}'
 				return ActionResult(error=error_msg)
 
-		@self.registry.action('')
+		@self.registry.action('Scroll to text.')
 		async def find_text(text: str, browser_session: BrowserSession):  # type: ignore
 			# Dispatch scroll to text event
 			event = browser_session.event_bus.dispatch(ScrollToTextEvent(text=text))
@@ -839,9 +928,10 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				)
 
 		@self.registry.action(
-			'Request screenshot of current viewport. Use when: visual inspection needed, layout unclear, element positions uncertain, debugging UI issues, or verifying page state. Screenshot included in next observation.',
+			'Get a screenshot of the current viewport. Use when: visual inspection needed, layout unclear, element positions uncertain, debugging UI issues, or verifying page state. Screenshot is included in the next browser_state No parameters are needed.',
+			param_model=NoParamsAction,
 		)
-		async def screenshot():
+		async def screenshot(_: NoParamsAction):
 			"""Request that a screenshot be included in the next observation"""
 			memory = 'Requested screenshot for next observation'
 			msg = f'📸 {memory}'
@@ -884,7 +974,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			)
 
 		@self.registry.action(
-			'',
+			'Set the option of a <select> element.',
 			param_model=SelectDropdownOptionAction,
 		)
 		async def select_dropdown(params: SelectDropdownOptionAction, browser_session: BrowserSession):
@@ -930,7 +1020,9 @@ You will be given a query and the markdown of a webpage that has been filtered t
 
 		# File System Actions
 
-		@self.registry.action('')
+		@self.registry.action(
+			'Write content to a file in the local file system. Use this to create new files or overwrite entire file contents. For targeted edits within existing files, use replace_file instead. Supports alphanumeric filename and file extension formats: .txt, .md, .json, .jsonl, .csv, .pdf. For PDF files, write content in markdown format and it will be automatically converted to a properly formatted PDF document.'
+		)
 		async def write_file(
 			file_name: str,
 			content: str,
@@ -947,24 +1039,38 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				result = await file_system.append_file(file_name, content)
 			else:
 				result = await file_system.write_file(file_name, content)
-			logger.info(f'💾 {result}')
+
+			# Log the full path where the file is stored
+			file_path = file_system.get_dir() / file_name
+			logger.info(f'💾 {result} File location: {file_path}')
+
 			return ActionResult(extracted_content=result, long_term_memory=result)
 
-		@self.registry.action('')
+		@self.registry.action(
+			'Replace specific text within a file by searching for old_str and replacing with new_str. Use this for targeted edits like updating todo checkboxes or modifying specific lines without rewriting the entire file.'
+		)
 		async def replace_file(file_name: str, old_str: str, new_str: str, file_system: FileSystem):
 			result = await file_system.replace_file_str(file_name, old_str, new_str)
 			logger.info(f'💾 {result}')
 			return ActionResult(extracted_content=result, long_term_memory=result)
 
-		@self.registry.action('')
+		@self.registry.action(
+			'Read the complete content of a file. Use this to view file contents before editing or to retrieve data from files. Supports text files (txt, md, json, csv, jsonl), documents (pdf, docx), and images (jpg, png).'
+		)
 		async def read_file(file_name: str, available_file_paths: list[str], file_system: FileSystem):
 			if available_file_paths and file_name in available_file_paths:
-				result = await file_system.read_file(file_name, external_file=True)
+				structured_result = await file_system.read_file_structured(file_name, external_file=True)
 			else:
-				result = await file_system.read_file(file_name)
+				structured_result = await file_system.read_file_structured(file_name)
+
+			result = structured_result['message']
+			images = structured_result.get('images')
 
 			MAX_MEMORY_SIZE = 1000
-			if len(result) > MAX_MEMORY_SIZE:
+			# For images, create a shorter memory message
+			if images:
+				memory = f'Read image file {file_name}'
+			elif len(result) > MAX_MEMORY_SIZE:
 				lines = result.splitlines()
 				display = ''
 				lines_count = 0
@@ -982,6 +1088,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			return ActionResult(
 				extracted_content=result,
 				long_term_memory=memory,
+				images=images,
 				include_extracted_content_only_once=True,
 			)
 
@@ -1046,13 +1153,47 @@ Validated Code (after quote fixing):
 					# Primitive values (string, number, boolean)
 					result_text = str(value)
 
-				# Apply length limit with better truncation
+				import re
+
+				image_pattern = r'(data:image/[^;]+;base64,[A-Za-z0-9+/=]+)'
+				found_images = re.findall(image_pattern, result_text)
+
+				metadata = None
+				if found_images:
+					# Store images in metadata so they can be added as ContentPartImageParam
+					metadata = {'images': found_images}
+
+					# Replace image data in result text with shorter placeholder
+					modified_text = result_text
+					for i, img_data in enumerate(found_images, 1):
+						placeholder = '[Image]'
+						modified_text = modified_text.replace(img_data, placeholder)
+					result_text = modified_text
+
+				# Apply length limit with better truncation (after image extraction)
 				if len(result_text) > 20000:
 					result_text = result_text[:19950] + '\n... [Truncated after 20000 characters]'
+
 				# Don't log the code - it's already visible in the user's cell
 				logger.debug(f'JavaScript executed successfully, result length: {len(result_text)}')
+
+				# Memory handling: keep full result in extracted_content for current step,
+				# but use truncated version in long_term_memory if too large
+				MAX_MEMORY_LENGTH = 1000
+				if len(result_text) < MAX_MEMORY_LENGTH:
+					memory = result_text
+					include_extracted_content_only_once = False
+				else:
+					memory = f'JavaScript executed successfully, result length: {len(result_text)} characters.'
+					include_extracted_content_only_once = True
+
 				# Return only the result, not the code (code is already in user's cell)
-				return ActionResult(extracted_content=result_text)
+				return ActionResult(
+					extracted_content=result_text,
+					long_term_memory=memory,
+					include_extracted_content_only_once=include_extracted_content_only_once,
+					metadata=metadata,
+				)
 
 			except Exception as e:
 				# CDP communication or other system errors
@@ -1074,7 +1215,7 @@ Validated Code (after quote fixing):
 		fixed_code = re.sub(r'\\\\([.*+?^${}()|[\]])', r'\\\1', fixed_code)
 
 		# Pattern 3: Fix XPath expressions with mixed quotes
-		xpath_pattern = r'document\.evaluate\s*\(\s*"([^"]*\'[^"]*)"'
+		xpath_pattern = r'document\.evaluate\s*\(\s*"([^"]*)"\s*,'
 
 		def fix_xpath_quotes(match):
 			xpath_with_quotes = match.group(1)
@@ -1083,7 +1224,7 @@ Validated Code (after quote fixing):
 		fixed_code = re.sub(xpath_pattern, fix_xpath_quotes, fixed_code)
 
 		# Pattern 4: Fix querySelector/querySelectorAll with mixed quotes
-		selector_pattern = r'(querySelector(?:All)?)\s*\(\s*"([^"]*\'[^"]*)"'
+		selector_pattern = r'(querySelector(?:All)?)\s*\(\s*"([^"]*)"\s*\)'
 
 		def fix_selector_quotes(match):
 			method_name = match.group(1)
@@ -1093,7 +1234,7 @@ Validated Code (after quote fixing):
 		fixed_code = re.sub(selector_pattern, fix_selector_quotes, fixed_code)
 
 		# Pattern 5: Fix closest() calls with mixed quotes
-		closest_pattern = r'\.closest\s*\(\s*"([^"]*\'[^"]*)"'
+		closest_pattern = r'\.closest\s*\(\s*"([^"]*)"\s*\)'
 
 		def fix_closest_quotes(match):
 			selector_with_quotes = match.group(1)
@@ -1102,7 +1243,7 @@ Validated Code (after quote fixing):
 		fixed_code = re.sub(closest_pattern, fix_closest_quotes, fixed_code)
 
 		# Pattern 6: Fix .matches() calls with mixed quotes (similar to closest)
-		matches_pattern = r'\.matches\s*\(\s*"([^"]*\'[^"]*)"'
+		matches_pattern = r'\.matches\s*\(\s*"([^"]*)"\s*\)'
 
 		def fix_matches_quotes(match):
 			selector_with_quotes = match.group(1)
@@ -1135,12 +1276,8 @@ Validated Code (after quote fixing):
 			)
 			async def done(params: StructuredOutputAction):
 				# Exclude success from the output JSON since it's an internal parameter
-				output_dict = params.data.model_dump()
-
-				# Enums are not serializable, convert to string
-				for key, value in output_dict.items():
-					if isinstance(value, enum.Enum):
-						output_dict[key] = value.value
+				# Use mode='json' to properly serialize enums at all nesting levels
+				output_dict = params.data.model_dump(mode='json')
 
 				return ActionResult(
 					is_done=True,
@@ -1195,7 +1332,12 @@ Validated Code (after quote fixing):
 				)
 
 	def use_structured_output_action(self, output_model: type[T]):
+		self._output_model = output_model
 		self._register_done_action(output_model)
+
+	def get_output_model(self) -> type[BaseModel] | None:
+		"""Get the output model if structured output is configured."""
+		return self._output_model
 
 	# Register ---------------------------------------------------------------
 
@@ -1206,6 +1348,71 @@ Validated Code (after quote fixing):
 		"""
 		return self.registry.action(description, **kwargs)
 
+	def exclude_action(self, action_name: str) -> None:
+		"""Exclude an action from the tools registry.
+
+		This method can be used to remove actions after initialization,
+		useful for enforcing constraints like disabling screenshot when use_vision != 'auto'.
+
+		Args:
+			action_name: Name of the action to exclude (e.g., 'screenshot')
+		"""
+		self.registry.exclude_action(action_name)
+
+	def _register_click_action(self) -> None:
+		"""Register the click action with or without coordinate support based on current setting."""
+		# Remove existing click action if present
+		if 'click' in self.registry.registry.actions:
+			del self.registry.registry.actions['click']
+
+		if self._coordinate_clicking_enabled:
+			# Register click action WITH coordinate support
+			@self.registry.action(
+				'Click element by index or coordinates. Use coordinates only if the index is not available. Either provide coordinates or index.',
+				param_model=ClickElementAction,
+			)
+			async def click(params: ClickElementAction, browser_session: BrowserSession):
+				# Validate that either index or coordinates are provided
+				if params.index is None and (params.coordinate_x is None or params.coordinate_y is None):
+					return ActionResult(error='Must provide either index or both coordinate_x and coordinate_y')
+
+				# Try index-based clicking first if index is provided
+				if params.index is not None:
+					return await self._click_by_index(params, browser_session)
+				# Coordinate-based clicking when index is not provided
+				else:
+					return await self._click_by_coordinate(params, browser_session)
+		else:
+			# Register click action WITHOUT coordinate support (index only)
+			@self.registry.action(
+				'Click element by index.',
+				param_model=ClickElementActionIndexOnly,
+			)
+			async def click(params: ClickElementActionIndexOnly, browser_session: BrowserSession):
+				return await self._click_by_index(params, browser_session)
+
+	def set_coordinate_clicking(self, enabled: bool) -> None:
+		"""Enable or disable coordinate-based clicking.
+
+		When enabled, the click action accepts both index and coordinate parameters.
+		When disabled (default), only index-based clicking is available.
+
+		This is automatically enabled for models that support coordinate clicking:
+		- claude-sonnet-4-5
+		- claude-opus-4-5
+		- gemini-3-pro
+		- browser-use/* models
+
+		Args:
+			enabled: True to enable coordinate clicking, False to disable
+		"""
+		if enabled == self._coordinate_clicking_enabled:
+			return  # No change needed
+
+		self._coordinate_clicking_enabled = enabled
+		self._register_click_action()
+		logger.debug(f'Coordinate clicking {"enabled" if enabled else "disabled"}')
+
 	# Act --------------------------------------------------------------------
 	@observe_debug(ignore_input=True, ignore_output=True, name='act')
 	@time_execution_sync('--act')
@@ -1213,7 +1420,6 @@ Validated Code (after quote fixing):
 		self,
 		action: ActionModel,
 		browser_session: BrowserSession,
-		#
 		page_extraction_llm: BaseChatModel | None = None,
 		sensitive_data: dict[str, str | dict[str, str]] | None = None,
 		available_file_paths: list[str] | None = None,
@@ -1498,7 +1704,7 @@ class CodeAgentTools(Tools[Context]):
 								if not browser_session.is_local:
 									pass
 								else:
-									msg = f'File path {params.path} is not available. Upload files must be in available_file_paths, downloaded_files, or a file managed by file_system.'
+									msg = f'File path {params.path} is not available. To fix: add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{params.path}"])'
 									logger.error(f'❌ {msg}')
 									return ActionResult(error=msg)
 						else:
@@ -1506,7 +1712,7 @@ class CodeAgentTools(Tools[Context]):
 							if not browser_session.is_local:
 								pass
 							else:
-								msg = f'File path {params.path} is not available. Upload files must be in available_file_paths or downloaded_files.'
+								msg = f'File path {params.path} is not available. To fix: add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{params.path}"])'
 								logger.error(f'❌ {msg}')
 								return ActionResult(error=msg)
 
@@ -1570,7 +1776,11 @@ class CodeAgentTools(Tools[Context]):
 
 			# Highlight the file input element if found (truly non-blocking)
 			if file_input_node:
-				asyncio.create_task(browser_session.highlight_interaction_element(file_input_node))
+				create_task_with_error_handling(
+					browser_session.highlight_interaction_element(file_input_node),
+					name='highlight_file_input',
+					suppress_exceptions=True,
+				)
 
 			# If not found near the selected element, fallback to finding the closest file input to current scroll position
 			if file_input_node is None:
@@ -1605,8 +1815,13 @@ class CodeAgentTools(Tools[Context]):
 				if closest_file_input:
 					file_input_node = closest_file_input
 					logger.info(f'Found file input closest to scroll position (distance: {min_distance}px)')
+
 					# Highlight the fallback file input element (truly non-blocking)
-					asyncio.create_task(browser_session.highlight_interaction_element(file_input_node))
+					create_task_with_error_handling(
+						browser_session.highlight_interaction_element(file_input_node),
+						name='highlight_file_input_fallback',
+						suppress_exceptions=True,
+					)
 				else:
 					msg = 'No file upload element found on the page'
 					logger.error(msg)
